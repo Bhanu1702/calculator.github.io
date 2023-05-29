@@ -1,0 +1,3469 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: 'SentinelConnect SAM Template for SentinelConnect'
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 20
+
+Parameters:
+  ApiName:
+    Type: String
+    Default: SentinelConnectApi
+    Description: This is sentinelconnectApi
+  AdminWebApiGatewayStageName:
+    Type: String
+    AllowedPattern: ^[a-z0-9A-Z]+$
+    Default: QA
+  UserName:
+    Type: String
+  Email:
+    Type: String
+  PhoneNo:
+    Type: String
+  Name:
+    Type: String
+  TableName: 
+    Type: String
+    Default: SystemConfig
+  ArtifactsBucketName:
+    Type: String
+    Default: transactionartifacts-bucket-change
+  CloudWatchLogsBucketName: 
+    Type: String
+    Default: cloudwatch-logs-delivery-bucket-change
+  S3EventBucketName: 
+    Type: String
+    Default: sap-testing-sentinelconnect-zuora-changes-de
+    
+Resources:
+ 
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Cognito Infrastructure                                                       #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: SentinelConnectCognitoUserPool
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: phone_number
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: Role
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+        - Name: ClientId
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: SentinelConnectCognitoClient
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: SentinelConnectCognitoIdentityPool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId:
+            Ref: CognitoUserPoolClient
+          ProviderName:
+            Fn::GetAtt: [CognitoUserPool, ProviderName]
+
+  CognitoIdentityPoolRoles:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId:
+        Ref: CognitoIdentityPool
+      Roles:
+        authenticated:
+          Fn::GetAtt: [CognitoAuthRole, Arn]
+        unauthenticated:
+          Fn::GetAtt: [CognitoUnauthRole, Arn]
+         
+  CognitoAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "", [ !Ref AWS::Region, "SentinelConnectCognitoAppAuthRole"] ]
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud":
+                  Ref: CognitoIdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: "CognitoAuthorizedPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobileanalytics:PutEvents"
+                  - "cognito-sync:*"
+                  - "cognito-identity:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "execute-api:Invoke"
+                Resource: "*"
+
+  CognitoUnauthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "", [ !Ref AWS::Region, "SentinelConnectCognitoAppUnauthRole"] ]
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud":
+                  Ref: CognitoIdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": unauthenticated
+      Policies:
+        - PolicyName: "CognitoUnauthorizedPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobileanalytics:PutEvents"
+                  - "cognito-sync:*"
+                  - "cognito-identity:*"
+                Resource: "*"
+
+  
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect DynamoDB Infrastructure                                                      #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  ClientDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Client
+      AttributeDefinitions:
+        - AttributeName: Region
+          AttributeType: S
+        - AttributeName: GUID
+          AttributeType: S
+        - AttributeName: Name
+          AttributeType: S
+        - AttributeName: ServiceAccountId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Region
+          KeyType: HASH
+        - AttributeName: GUID
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 20
+        WriteCapacityUnits: 20
+
+      LocalSecondaryIndexes:
+        - IndexName: Region-ServiceAccountId-index
+          KeySchema:
+            - AttributeName: Region
+              KeyType: HASH
+            - AttributeName: ServiceAccountId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Make All columns available in index
+        - IndexName: Region-Name-index
+          KeySchema:
+            - AttributeName: Region
+              KeyType: HASH
+            - AttributeName: Name
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Make All columns available in index
+
+  MessageDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Message
+      AttributeDefinitions:
+        - AttributeName: MessageType
+          AttributeType: S
+        - AttributeName: TimeStamp
+          AttributeType: S
+        - AttributeName: ClientId
+          AttributeType: S
+        - AttributeName: ExternalId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: MessageType
+          KeyType: HASH
+        - AttributeName: TimeStamp
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 40
+        WriteCapacityUnits: 40
+      LocalSecondaryIndexes:
+        - IndexName: MessageType-ClientId-index
+          KeySchema:
+            - AttributeName: MessageType
+              KeyType: HASH
+            - AttributeName: ClientId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Make All columns available in index
+        - IndexName: MessageType-ExternalId-index
+          KeySchema:
+            - AttributeName: MessageType
+              KeyType: HASH
+            - AttributeName: ExternalId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Make All columns available in index 
+      GlobalSecondaryIndexes:
+        - IndexName: ClientId-TimeStamp-index
+          KeySchema:
+            - AttributeName: ClientId
+              KeyType: HASH
+            - AttributeName: TimeStamp
+              KeyType: RANGE
+          ProvisionedThroughput:
+            ReadCapacityUnits: 20
+            WriteCapacityUnits: 20
+          Projection:
+           ProjectionType: ALL
+
+  SystemConfigDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SystemConfig
+      AttributeDefinitions:
+        - AttributeName: System
+          AttributeType: S
+        - AttributeName: Version
+          AttributeType: S
+      KeySchema:
+        - AttributeName: System
+          KeyType: HASH
+        - AttributeName: Version
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  QuickTrialUserStatusDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: QuickTrialUserStatus
+      AttributeDefinitions:
+        - AttributeName: UserType
+          AttributeType: S
+        - AttributeName: UserName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserType
+          KeyType: HASH
+        - AttributeName: UserName
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  # AuditDynamoDBTable:
+  #   Type: AWS::DynamoDB::Table
+  #   Properties:
+  #     TableName: Audit
+  #     AttributeDefinitions:
+  #       - AttributeName: ClientName
+  #         AttributeType: S
+  #     KeySchema:
+  #       - AttributeName: ClientName
+  #         KeyType: HASH
+  #     ProvisionedThroughput:
+  #       ReadCapacityUnits: 1
+  #       WriteCapacityUnits: 1      
+
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Policy and Role Infrastructure                                               #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+    
+  SentinelConnectDynamoDBAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy to allow SentinelConnect to access the DynamoDB tables created by this template.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:DeleteItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:BatchGetItem
+              - dynamodb:BatchWriteItem
+              - dynamodb:ConditionCheckItem
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource:
+              # - !Join ["",[!GetAtt AuditDynamoDBTable.Arn]]
+              - !Join ["",[!GetAtt ClientDynamoDBTable.Arn]]
+              - !Join ["",[!GetAtt MessageDynamoDBTable.Arn]]
+              - !Join ["",[!GetAtt SystemConfigDynamoDBTable.Arn]]
+              - !Join ["",[!GetAtt QuickTrialUserStatusDynamoDBTable.Arn]]
+              - !Join ["",[!Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Client/index/*']]
+              - !Join ["",[!Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Message/index/*']]
+             
+
+  SentinelConnectCognitoAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy to allow SentinelConnect to access the Cognito UserPool created by this template.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - cognito-idp:AdminGetUser
+              - cognito-idp:AdminDeleteUser
+              - cognito-idp:AdminInitiateAuth
+              - cognito-idp:AdminEnableUser
+              - cognito-idp:AdminCreateUser
+              - cognito-idp:AdminDisableUser
+              - cognito-idp:AdminUpdateUserAttributes
+              - cognito-idp:AdminRespondToAuthChallenge
+              - cognito-idp:ListUsers
+            Resource: !GetAtt CognitoUserPool.Arn
+
+  SentinelConnectTransactionsDetailsAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy to allow SentinelConnect to access the Storechartdataobjects and Getchartdata objects
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:ListBucket
+              - s3:GetObject
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SentinelConnectTransactionsDetails
+                
+  SentinelConnectS3EventNotificationAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy to allow SentinelConnect to access the SAP objects
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:DeleteObject
+              - s3:*
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SentinelConnectSAPEntitlement
+
+  SentinelConnectLogsDetailsBucketAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy to allow SentinelConnect to access the cloudwatchlogs to s3 bucket 
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 
+              - s3:GetBucketAcl
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SentinelConnectCloudwatchLogsBucket
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SentinelConnectCloudwatchLogsBucket
+                - random-string/*
+
+  SentinelConnectLogsDetailsAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy to allow SentinelConnect to access logs
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:PutLogEvents
+              - logs:CreateLogGroup
+              - logs:PutSubscriptionFilter
+              - logs:PutLogEventsBatch
+              - logs:CreateLogStream
+              - logs:CreateExportTask
+              - logs:DescribeLogGroups
+              - logs:PutResourcePolicy
+              - logs:DeleteResourcePolicy
+            Resource: "arn:aws:logs:*:*:*"
+
+  SentinelConnectAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "", [ !Ref AWS::Region, SentinelConnectAccessRole] ]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+        - arn:aws:iam::aws:policy/AWSLambdaInvocation-DynamoDB
+        - !Ref SentinelConnectDynamoDBAccessPolicy
+        - !Ref SentinelConnectCognitoAccessPolicy
+        - !Ref SentinelConnectTransactionsDetailsAccessPolicy
+        - !Ref SentinelConnectLogsDetailsAccessPolicy
+        - !Ref SentinelConnectLogsDetailsBucketAccessPolicy
+       
+    DependsOn:
+      - SentinelConnectDynamoDBAccessPolicy
+      - SentinelConnectCognitoAccessPolicy
+      - SentinelConnectTransactionsDetailsAccessPolicy
+      - SentinelConnectLogsDetailsAccessPolicy
+      - SentinelConnectLogsDetailsBucketAccessPolicy
+ 
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Service API Infrastructure                                                   #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  
+  # SentinelConnect Service API
+  SentinelConnectServiceApi:
+    DependsOn: CognitoUserPool
+    Description: A ServerlessApi for Sentinel Connect Service Portal
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1
+      EndpointConfiguration: REGIONAL
+      Name: !Ref ApiName
+      Cors:
+         AllowMethods: "'*'"
+         AllowHeaders: "'*'"
+         AllowOrigin: "'*'"
+      Auth:
+        Authorizers:
+           SentinalConnectServiceCognitoAuthorizer:
+              UserPoolArn: !GetAtt "CognitoUserPool.Arn"
+        AddDefaultAuthorizerToCorsPreflight: False
+        
+  SentinelConnectServiceApiRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      Name: Validate body, query string parameters, and headers
+      RestApiId: !Ref SentinelConnectServiceApi
+      ValidateRequestBody: true
+
+  SentinelConnectServiceApiGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+       # gatewayresponse.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+        gatewayresponse.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+        gatewayresponse.header.Referrer-Policy: "'no-referrer'"
+        gatewayresponse.header.X-Frame-Options: "'DENY'"
+        gatewayresponse.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+        gatewayresponse.header.X-Content-Type-Options: "'nosniff'"
+      ResponseTemplates:
+             "application/json": '{ "status": "PROCESSING", "message": "Please come back with same GUID, it may take some time to process." }'
+      ResponseType: INTEGRATION_TIMEOUT
+      RestApiId: !Ref SentinelConnectServiceApi
+      StatusCode: '202' 
+
+  SentinelConnectServiceApiGatewayResponseAccessToken:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+       # gatewayresponse.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+        gatewayresponse.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+        gatewayresponse.header.Referrer-Policy: "'no-referrer'"
+        gatewayresponse.header.X-Frame-Options: "'DENY'"
+        gatewayresponse.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+        gatewayresponse.header.X-Content-Type-Options: "'nosniff'"
+      ResponseTemplates:
+             "application/json": '{ "status": "EXPIRED TOKEN", "message":"Access token has expired or is empty." }'
+      ResponseType: EXPIRED_TOKEN
+      RestApiId: !Ref SentinelConnectServiceApi
+      StatusCode: '401' 
+
+  
+  SentinelConnectServiceApiGatewayModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      ContentType: 'application/json'
+      RestApiId: !Ref SentinelConnectServiceApi
+      Name: SentinelConnectApiGatewayModel
+      Schema: {}
+
+  #SentinelConnect Layers
+  CustomerAndContactLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-CustomerAndContact
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My SentinelConnect-Service-CustomerAndContact lamda layers
+      LayerName: SentinelConnect-Service-CustomerAndContact
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete
+
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-Dependencies
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My lamda SentinelConnect-Service-Dependencies layers
+      LayerName: SentinelConnect-Service-Dependencies
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete    
+
+  ServicePartnerLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-Partner
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My lamda SentinelConnect-Service-Partner layers
+      LayerName: SentinelConnect-Service-Partner
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete    
+
+  ServiceProductLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-Product  
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My lamda SentinelConnect-Service-Product layers
+      LayerName: SentinelConnect-Service-Product
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete
+
+  CreateProduct:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-CreateProduct
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My SentinelConnect-Service-CreateProduct lamda layers
+      LayerName: SentinelConnect-Service-CreateProduct
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete
+ 
+  #SentinelConnect Service Lambdas
+  SentinelConnectServiceAuthenticationToken:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/service/Auth/SentinelConnect-Service-AuthToken
+      FunctionName: SentinelConnect-Service-AuthToken
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          ClientId: !Ref CognitoUserPoolClient
+          UserPoolId: !Ref CognitoUserPool
+      Events:     
+        token:
+           Type: Api
+           Properties:
+             Path: /token
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+
+  SentinelConnectServiceAuthenticationTokenLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectServiceAuthenticationToken}"
+
+  SentinelConnectServiceCreateEntitlement:  
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-Service-CreateEntitlement
+      Description: "SentinelConnectServiceCreateentitlement function"
+      CodeUri: api/service/lambdas/SentinelConnect-Service-CreateEntitlement
+      Handler: index.handler
+      Runtime: nodejs12.x 
+      Layers:
+         - !Ref CustomerAndContactLayer
+         - !Ref DependenciesLayer
+         - !Ref ServicePartnerLayer
+         - !Ref ServiceProductLayer      
+      MemorySize: 128      
+      Timeout: 40      
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectServiceCreateEntitlementLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectServiceCreateEntitlement}"
+   
+  SentinelConnectServiceExecutionFlow:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-ExecutionFlow
+       Description: SentinelConnectServiceExecutionFlow Function 
+       CodeUri: api/service/lambdas/SentinelConnect-Service-ExecutionFlow
+       MemorySize: 128
+       Timeout: 60
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref CustomerAndContactLayer
+         - !Ref DependenciesLayer
+         - !Ref ServicePartnerLayer
+         - !Ref ServiceProductLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Events:
+         activation:
+           Type: Api
+           Properties:
+             Path: /activation
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+             RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true 
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer
+         entitlement:
+            Type: Api
+            Properties:
+              Path: /entitlement
+              RestApiId: !Ref SentinelConnectServiceApi
+              Method: GET
+              Auth:
+                Authorizer: SentinalConnectServiceCognitoAuthorizer
+              RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true  
+
+         POST:
+            Type: Api
+            Properties:
+              Path: /entitlement
+              RestApiId: !Ref SentinelConnectServiceApi
+              Method: POST
+              Auth:
+                Authorizer: SentinalConnectServiceCognitoAuthorizer
+              RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true  
+         PUT:
+            Type: Api
+            Properties:
+              Path: /entitlement
+              RestApiId: !Ref SentinelConnectServiceApi
+              Method: PUT
+              RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true
+              Auth:
+                Authorizer: SentinalConnectServiceCognitoAuthorizer
+         sync:
+            Type: Api
+            Properties:
+              Path: /sync
+              RestApiId: !Ref SentinelConnectServiceApi
+              Method: PATCH
+              RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true
+              Auth:
+                Authorizer: SentinalConnectServiceCognitoAuthorizer
+       Environment:
+         Variables:
+          ActivateEntitlement: SentinelConnect-Service-ActivateEntitlement
+          CreateEntitlement: SentinelConnect-Service-CreateEntitlement
+          InputValidation: SentinelConnect-Service-ValidationEngine
+          LogGroupName: SentinelConnect
+          LogName: SentinelConnect
+          SoapRequest: /entitlement/soap
+          UpdateEntitlement: SentinelConnect-Service-UpdateEntitlement
+          ValidateAndSaveRequest: SentinelConnect-Service-PersistenceEngine
+          privatekey: 
+
+  SentinelConnectServiceExecutionFlowLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectServiceExecutionFlow}"
+
+  SentinelConnectServicePersistenceEngine:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-PersistenceEngine
+       Description: SentinelConnect-Service-PersistenceEngine
+       CodeUri: api/service/lambdas/SentinelConnect-Service-PersistenceEngine
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref DependenciesLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Environment:
+         Variables:
+            ClientTable: Client
+            MessageTable: Message
+            MessageTypeExternalIdIndex: MessageType-ExternalId-index
+            SystemTable: SystemConfig
+            BucketName: !Ref SentinelConnectTransactionsDetails
+
+  SentinelConnectServicePersistenceEngineLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectServicePersistenceEngine}"
+
+  SentinelConnectServiceUpdateEntitlement:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-UpdateEntitlement
+       Description: SentinelConnect-Service-UpdateEntitlement
+       CodeUri: api/service/lambdas/SentinelConnect-Service-UpdateEntitlement
+       MemorySize: 128
+       Timeout: 40
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref DependenciesLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectServiceUpdateEntitlementLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectServiceUpdateEntitlement}"
+
+  SentinelConnectServiceValidationEngine:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-ValidationEngine
+       Description: SentinelConnect-Service-ValidationEngine
+       CodeUri: api/service/lambdas/SentinelConnect-Service-ValidationEngine
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref CustomerAndContactLayer
+         - !Ref DependenciesLayer
+         - !Ref ServicePartnerLayer
+         - !Ref ServiceProductLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectServiceValidationEngineLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectServiceValidationEngine}"
+
+  SentinelConnectServiceQuickTrialStepsHandler:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-QuickTrialStepsHandler
+       CodeUri: api/service/lambdas/SentinelConnect-Service-QuickTrialStepsHandler
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref DependenciesLayer
+         - !Ref CreateProduct
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Events:
+         quickStartTrialPost:
+           Type: Api
+           Properties:
+             Path: /quick-start-trial
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer
+         quickStartTrialGet:
+           Type: Api
+           Properties:
+             Path: /quick-start-trial
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: GET
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer
+         quickStartTrialPut:
+           Type: Api
+           Properties:
+             Path: /quick-start-trial
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: PUT
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer
+         ViewSourceCodeGet:
+           Type: Api
+           Properties:
+             Path: /viewsourcecode
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: GET
+             RequestParameters:
+                - method.request.querystring.stepstatus
+             Auth:
+              Authorizer: SentinalConnectServiceCognitoAuthorizer
+       Environment:
+         Variables:
+          UserStatusTable: !Ref QuickTrialUserStatusDynamoDBTable 
+          BucketName: !Ref ArtifactsBucketName
+
+  SentinelConnectServiceQuickTrialStepsHandlerLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectServiceQuickTrialStepsHandler}"
+
+
+  SentinelConnectServiceOracleProcessEntitlement:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-Oracle-entitlement
+       Description: SentinelConnect-Service-OracleProcessEntitlement
+       CodeUri: api/service/lambdas/SentinelConnect-Service-OracleEntitlement
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Layers:
+         - !Ref DependenciesLayer
+       Events:
+         oracleentitlement:
+           Type: Api
+           Properties:
+             Path: /oracle-entitlement
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+       Environment:
+         Variables:
+          ClientTable: Client
+          Entitlement: SentinelConnect-Service-ExecutionFlow
+          UserPoolId: !Ref CognitoUserPool
+
+  SentinelConnectServiceSAPEntitlement:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-SAPEntitlement
+       Description: SentinelConnect-Service-SAPEntitlement
+       CodeUri: api/service/lambdas/SentinelConnect-Service-SAPEntitlement
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Policies: !Ref SentinelConnectS3EventNotificationAccessPolicy
+       Layers:
+         - !Ref DependenciesLayer
+       Environment:
+         Variables:
+          ClientTable: Client
+          BucketName: !Ref S3EventBucketName
+          UserPoolId: !Ref CognitoUserPool
+          Entitlement: SentinelConnect-Service-ExecutionFlow
+
+  SentinelConnectServicePrepareMetadata:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-PrepareMetadata
+       Description: SentinelConnect-Service-PrepareMetadata
+       CodeUri: api/service/lambdas/SentinelConnect-Service-PrepareMetadata
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Policies: !Ref SentinelConnectS3EventNotificationAccessPolicy
+       Layers:
+         - !Ref DependenciesLayer
+       Events:
+         MetadataPost:
+           Type: Api
+           Properties:
+             Path: /Metadata
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer
+            #  RequestParameters:
+            #   - method.request.header.authorization:
+            #       Required: true
+            #   - method.request.header.guid:
+            #       Required: true
+            #  Auth: NONE  
+       Environment:
+         Variables:
+          BucketName: !Ref S3EventBucketName 
+
+  SentinelConnectServiceZuoraSubscription:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-ZuoraSubscription
+       Description: SentinelConnect-Service-ZuoraSubscription
+       CodeUri: api/service/lambdas/SentinelConnect-Service-ZuoraSubscription
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Policies: !Ref SentinelConnectS3EventNotificationAccessPolicy
+       Layers:
+         - !Ref DependenciesLayer
+       Events:
+         ZuoraSubscriptionPost:
+           Type: Api
+           Properties:
+             Path: /ZuoraSubscription
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+            #  Auth:
+            #    Authorizer: NONE  
+       Environment:
+         Variables:
+          BucketName: !Ref S3EventBucketName
+          Entitlement: SentinelConnect-Service-ExecutionFlow
+          UserPoolId: us-west-1_h4umILS3c
+
+  SentinelConnectServiceGetMetadata:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-GetMetadata
+       Description: SentinelConnect-Service-GetMetadata
+       CodeUri: api/service/lambdas/SentinelConnect-Service-GetMetadata
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Policies: !Ref SentinelConnectS3EventNotificationAccessPolicy
+       Layers:
+         - !Ref DependenciesLayer
+       Events:
+         MetadataGET:
+           Type: Api
+           Properties:
+             Path: /Metadata
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: GET
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer  
+       Environment:
+         Variables:
+          BucketName: !Ref S3EventBucketName                            
+
+  LambdaAuthorizerFunction:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-SAP-IDOC-Authorizer
+       Description: SentinelConnect-SAP-IDOC-Authorizer
+       CodeUri: api/service/lambdas/SentinelConnect-SAP-idoc-authorizer
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Environment:
+         Variables:
+          BucketName: !Ref S3EventBucketName
+          CognitoUserPoolId: !Ref CognitoUserPool
+          CognitoUserPoolClientId:   !Ref CognitoUserPoolClient
+
+  LambdaS3AccessFunction:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-SAP-IDOC-SAPListener
+       Description: SentinelConnect-SAP-IDOC-SAPListener
+       CodeUri: api/service/lambdas/SentinelConnect-SAP-IDOC-SAPListener
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Layers:
+         - !Ref DependenciesLayer
+       Environment:
+         Variables:
+          BucketName: !Ref S3EventBucketName
+          CognitoUserPoolId: !Ref CognitoUserPool
+          CognitoUserPoolClientId:   !Ref CognitoUserPoolClient
+
+  S3LambdaAccess:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - LambdaS3AccessFunction
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SentinelConnectWebPortalRestApi}/*/*/*
+
+
+########################################################################
+#
+#  SentinelConnect Cloudwatch Logs Lambda& CloudwatchRule & s3Policy
+#
+##########################################################################
+
+  SentinelConnectCloudwatchLogs:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-Service-Cloudwatch
+      CodeUri: api/service/lambdas/SentinelConnect-Service-Cloudwatch
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Layers:
+         - !Ref DependenciesLayer
+      Environment:
+         Variables: 
+            BucketName: !Ref CloudWatchLogsBucketName
+
+  SentinelConnectCloudwatchLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectCloudwatchLogs}"
+
+  SentinelConnectLambdaLogsCloudwatchRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: cron(0 4 * * ? *)
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "SentinelConnectCloudwatchLogs"
+              - "Arn"
+          Id: "TargetFunction-SentinelConnectCloudwatchLogs"
+
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "SentinelConnectCloudwatchLogs"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "SentinelConnectLambdaLogsCloudwatchRule"
+          - "Arn"
+
+  CloudwatchLogsBucketPolicy:
+    DependsOn: SentinelConnectCloudwatchLogsBucket
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SentinelConnectCloudwatchLogsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 's3:PutObject'
+              - 's3:GetObject'
+            Effect: Allow
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SentinelConnectCloudwatchLogsBucket
+                - /*
+            Principal: { "Service": "logs.eu-central-1.amazonaws.com" }
+          - Action:
+              - 's3:GetBucketAcl'
+            Effect: Allow
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SentinelConnectCloudwatchLogsBucket
+            Principal: { "Service": "logs.eu-central-1.amazonaws.com" }
+
+  SentinelConnectCloudwatchLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref CloudWatchLogsBucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteLogFilesAfterOneYear
+            ExpirationInDays: 365
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: "True"
+        BlockPublicPolicy: "True"
+        IgnorePublicAcls: "True"
+        RestrictPublicBuckets: "True"
+    DeletionPolicy: Retain
+    
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Admin Web UI Infrastructure                                                  #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  SentinelConnectTransactionsDetails:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ArtifactsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: "True"
+        BlockPublicPolicy: "True"
+        IgnorePublicAcls: "True"
+        RestrictPublicBuckets: "True"
+    DeletionPolicy: Retain
+
+  SentinelConnectSAPEntitlement:
+    DependsOn: LambdaInvokePermission
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3EventBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt [ SentinelConnectServiceSAPEntitlement, Arn]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: "True"
+        BlockPublicPolicy: "True"
+        IgnorePublicAcls: "True"
+        RestrictPublicBuckets: "True"
+    DeletionPolicy: Retain
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: SentinelConnectServiceSAPEntitlement
+    Properties:
+      FunctionName:
+        Fn::GetAtt:
+          - SentinelConnectServiceSAPEntitlement
+          - Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:s3:::${S3EventBucketName}
+
+  SentinelConnectStoreChartDataScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Store Dashboards data lambda hourly trigger"
+      ScheduleExpression: "rate(1 hour)"
+      State: "ENABLED"
+      Targets: 
+        - 
+           Arn: 
+             Fn::GetAtt: 
+               - "SentinelConnectWebStoreChartData"
+               - "Arn"
+           Id: "TargetFunction-StoreChartData"
+
+  #Web UI API Gateway - SentinelConnectWeb
+  SentinelConnectWebPortalRestApi:
+   Type: "AWS::ApiGateway::RestApi"
+   Properties:
+     Name: SentinelConnectWeb
+     Description: A REST API for Sentinel Connect Admin Portal
+     FailOnWarnings: true
+     EndpointConfiguration:
+       Types:
+         - REGIONAL 
+  
+  # Authorizer
+  SentinelConnectWebCognitoAuthorizer:
+     Type: AWS::ApiGateway::Authorizer
+     Properties:
+       Name: SentinelConnectWebAuthorizer
+       Type: COGNITO_USER_POOLS
+       IdentitySource: method.request.header.authorization
+       ProviderARNs:
+        - Fn::GetAtt:
+            - CognitoUserPool
+            - Arn
+       RestApiId: !Ref SentinelConnectWebPortalRestApi
+
+  IDOCAdapterLambdaAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: IDOC_Adapter_Authorizer
+      Type: REQUEST
+      AuthorizerResultTtlInSeconds: 0
+      AuthorizerUri: !Sub 
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "LambdaAuthorizerFunction.Arn"
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      IdentitySource: "method.request.header.Authorization"
+
+        # Create a mock GET method for the IDOCAdapterAPI
+  IDOCMockGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref SAPResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref IDOCAdapterLambdaAuthorizer
+      Integration:
+          Type: MOCK
+          PassthroughBehavior: WHEN_NO_MATCH
+          IntegrationResponses:
+          - ResponseTemplates:
+              application/json: '{"statusCode": 200,"message:": "IDOC Adapter Connection Works!"}'
+            StatusCode: '200'
+          RequestTemplates:
+            application/json: '{"statusCode": 200}'
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+
+  IDOCMockPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref SAPResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref IDOCAdapterLambdaAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "LambdaS3AccessFunction.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+
+  
+  #Client Resource
+  ClientsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'clients'
+
+        #Client Resource
+  SAPResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'SAPResource'
+
+  #Client Resource Methods
+  ClientsMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref ClientsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebListClients.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES     
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }  
+          }
+
+  ClientsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: ClientsResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+            method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+            method.response.header.Referrer-Policy: "'no-referrer'"
+            method.response.header.X-Frame-Options: "'DENY'"
+            method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+            method.response.header.X-Content-Type-Options: "'nosniff'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+          method.response.header.Permissions-Policy: false
+          method.response.header.Strict-Transport-Security: false
+          method.response.header.Referrer-Policy: false
+          method.response.header.X-Frame-Options: false
+          method.response.header.Content-Security-Policy: false
+          method.response.header.X-Content-Type-Options: false
+
+  ClientsMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref ClientsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebCreateClient.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  
+  #Client/verifyemsdetails Resource
+  VerifyEMSDetailsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !Ref ClientsResource
+      PathPart: 'verifyemsdetails'
+
+  #Client/verifyemsdetails Resource Methods
+  VerifyEMSDetailsMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref VerifyEMSDetailsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebVerifyClientEMSDetails.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  VerifyEMSDetailsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: VerifyEMSDetailsResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+            method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+            method.response.header.Referrer-Policy: "'no-referrer'"
+            method.response.header.X-Frame-Options: "'DENY'"
+            method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+            method.response.header.X-Content-Type-Options: "'nosniff'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+          method.response.header.Permissions-Policy: false
+          method.response.header.Strict-Transport-Security: false
+          method.response.header.Referrer-Policy: false
+          method.response.header.X-Frame-Options: false
+          method.response.header.Content-Security-Policy: false
+          method.response.header.X-Content-Type-Options: false
+
+  #Dashboards Resource
+  DashboardsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'dashboards'
+
+  #Dashboard Resource Methods
+  DashboardsMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref DashboardsResource
+      HttpMethod: GET 
+      RequestParameters:
+        method.request.querystring.timeStamp: true
+        method.request.querystring.client: true
+        method.request.querystring.date: true
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebGetChartData.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$'),\n",
+                    "\n    \"selectedClient\": \"$input.params(\"client\")\",\n",
+                    "\n    \"selectedDate\": \"$input.params(\"date\")\",\n",
+                    "\n    \"timeStamp\": \"$input.params(\"timeStamp\")\"}"
+                  ]
+               ]
+            }
+          }
+
+  DashboardsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: DashboardsResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+            method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+            method.response.header.Referrer-Policy: "'no-referrer'"
+            method.response.header.X-Frame-Options: "'DENY'"
+            method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+            method.response.header.X-Content-Type-Options: "'nosniff'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+          method.response.header.Permissions-Policy: false
+          method.response.header.Strict-Transport-Security: false
+          method.response.header.Referrer-Policy: false
+          method.response.header.X-Frame-Options: false
+          method.response.header.Content-Security-Policy: false
+          method.response.header.X-Content-Type-Options: false
+
+  #Token Resource
+  TokenResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'token'
+
+  #Token Resource Methods
+  TokenMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref TokenResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectAuthenticationToken.Arn"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200             
+
+  #Transactions Resource
+  TransactionsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'transactions'
+  #Transaction Resource Methods
+  TransactionsMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref TransactionsResource
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.timestamp: true
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebListTransactions.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$'),\n",
+                    "\n    \"time\": \"$input.params(\"timeStamp\")\"}"
+                  ]
+               ]
+            }
+          }
+
+  TransactionsMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref TransactionsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebListTransactions.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  TranasctionsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: TransactionsResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:          
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+            method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+            method.response.header.Referrer-Policy: "'no-referrer'"
+            method.response.header.X-Frame-Options: "'DENY'"
+            method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+            method.response.header.X-Content-Type-Options: "'nosniff'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+          method.response.header.Permissions-Policy: false
+          method.response.header.Strict-Transport-Security: false
+          method.response.header.Referrer-Policy: false
+          method.response.header.X-Frame-Options: false
+          method.response.header.Content-Security-Policy: false
+          method.response.header.X-Content-Type-Options: false
+ 
+  # Transactions/Logs Resource
+  TranasctionLogsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !Ref TransactionsResource
+      PathPart: 'logs'
+  # Transactions/Logs Resource Methods
+  TranasctionLogsMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref TranasctionLogsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebTransactionLogs.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  TranasctionLogsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: TranasctionLogsResource
+      AuthorizationType: NONE      
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+            method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+            method.response.header.Referrer-Policy: "'no-referrer'"
+            method.response.header.X-Frame-Options: "'DENY'"
+            method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+            method.response.header.X-Content-Type-Options: "'nosniff'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+          method.response.header.Permissions-Policy: false
+          method.response.header.Strict-Transport-Security: false
+          method.response.header.Referrer-Policy: false
+          method.response.header.X-Frame-Options: false
+          method.response.header.Content-Security-Policy: false
+          method.response.header.X-Content-Type-Options: false
+
+  #Users Resource
+  UsersResources:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'users'
+  #Users Resource Methods
+  UsersMethodDelete:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref UsersResources
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebDeleteUser.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  UsersMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref UsersResources
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.client: true
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebListUsers.Arn"  
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$'),\n",
+                    "\n    \"selectedClient\": \"$input.params(\"client\")\"}"
+                  ]
+               ]
+            }
+          }
+
+  UsersMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref UsersResources
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebCreateUser.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  UsersMethodPut:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref UsersResources
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebUpdateUser.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  UsersMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: UsersResources
+      AuthorizationType: NONE 
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+            method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+            method.response.header.Referrer-Policy: "'no-referrer'"
+            method.response.header.X-Frame-Options: "'DENY'"
+            method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+            method.response.header.X-Content-Type-Options: "'nosniff'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+          method.response.header.Permissions-Policy: false
+          method.response.header.Strict-Transport-Security: false
+          method.response.header.Referrer-Policy: false
+          method.response.header.X-Frame-Options: false
+          method.response.header.Content-Security-Policy: false
+          method.response.header.X-Content-Type-Options: false
+
+  # #Delete client Resource
+  # DeleteclientResources:
+  #   Type: 'AWS::ApiGateway::Resource'
+  #   Properties:
+  #     RestApiId: !Ref SentinelConnectWebPortalRestApi
+  #     ParentId: !GetAtt 
+  #       - SentinelConnectWebPortalRestApi
+  #       - RootResourceId
+  #     PathPart: 'Deleteclient'
+  # #Deleteclient Resource Methods
+  # DeleteclientMethodDelete:
+  #   DependsOn: SentinelConnectWebPortalRestApi
+  #   Type: 'AWS::ApiGateway::Method'
+  #   Properties:
+  #     RestApiId: !Ref SentinelConnectWebPortalRestApi
+  #     ResourceId: !Ref DeleteclientResources
+  #     HttpMethod: DELETE
+  #     AuthorizationType: COGNITO_USER_POOLS
+  #     AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+  #     MethodResponses:
+  #        - StatusCode: 200
+  #          ResponseModels: { "application/json": "Empty" }
+  #          ResponseParameters:
+  #             method.response.header.Access-Control-Allow-Origin: true
+  #             method.response.header.Permissions-Policy: true
+  #             method.response.header.Strict-Transport-Security: true
+  #             method.response.header.Referrer-Policy: true
+  #             method.response.header.X-Frame-Options: true
+  #             method.response.header.Content-Security-Policy: true
+  #             method.response.header.X-Content-Type-Options: true
+  #     Integration:
+  #       Type: AWS
+  #       IntegrationHttpMethod: POST
+  #       Uri: !Sub
+  #         - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+  #         - lambdaArn: !GetAtt "SentinelConnectWebDeleteClientUser.Arn"
+  #       PassthroughBehavior: WHEN_NO_TEMPLATES
+  #       IntegrationResponses:
+  #         - ResponseTemplates:
+  #             application/json: ''
+  #           StatusCode: 200
+  #           ResponseParameters:          
+  #             method.response.header.Access-Control-Allow-Origin: "'*'"
+  #             method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+  #             method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+  #             method.response.header.Referrer-Policy: "'no-referrer'"
+  #             method.response.header.X-Frame-Options: "'DENY'"
+  #             method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+  #             method.response.header.X-Content-Type-Options: "'nosniff'"
+  #       "RequestTemplates": {
+  #         "application/json": {
+  #             "Fn::Join": [
+  #                 "",
+  #                 [
+  #                   "{\n    \"method\": \"$context.httpMethod\",\n",
+  #                   "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+  #                   "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+  #                   "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+  #                   "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+  #                   "\n    \"body\": $input.json('$')}"
+  #                 ]
+  #              ]
+  #           }
+  #         }
+
+  # DeleteclientMethodGet:
+  #   DependsOn: SentinelConnectWebPortalRestApi
+  #   Type: 'AWS::ApiGateway::Method'
+  #   Properties:
+  #     RestApiId: !Ref SentinelConnectWebPortalRestApi
+  #     ResourceId: !Ref DeleteclientResources
+  #     HttpMethod: GET
+  #     RequestParameters:
+  #       method.request.querystring.client: true
+  #     AuthorizationType: COGNITO_USER_POOLS
+  #     AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+  #     MethodResponses:
+  #        - StatusCode: 200
+  #          ResponseModels: { "application/json": "Empty" }
+  #          ResponseParameters:
+  #             method.response.header.Access-Control-Allow-Origin: true
+  #             method.response.header.Permissions-Policy: true
+  #             method.response.header.Strict-Transport-Security: true
+  #             method.response.header.Referrer-Policy: true
+  #             method.response.header.X-Frame-Options: true
+  #             method.response.header.Content-Security-Policy: true
+  #             method.response.header.X-Content-Type-Options: true
+  #     Integration:
+  #       Type: AWS
+  #       IntegrationHttpMethod: POST
+  #       Uri: !Sub
+  #         - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+  #         - lambdaArn: !GetAtt "SentinelConnectWebGetAuditDetails.Arn"  
+  #       PassthroughBehavior: WHEN_NO_TEMPLATES
+  #       IntegrationResponses:
+  #         - ResponseTemplates:
+  #             application/json: ''
+  #           StatusCode: 200
+  #           ResponseParameters:          
+  #             method.response.header.Access-Control-Allow-Origin: "'*'"
+  #             method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+  #             method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+  #             method.response.header.Referrer-Policy: "'no-referrer'"
+  #             method.response.header.X-Frame-Options: "'DENY'"
+  #             method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+  #             method.response.header.X-Content-Type-Options: "'nosniff'"
+  #       "RequestTemplates": {
+  #         "application/json": {
+  #             "Fn::Join": [
+  #                 "",
+  #                 [
+  #                   "{\n    \"method\": \"$context.httpMethod\",\n",
+  #                   "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+  #                   "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+  #                   "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+  #                   "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+  #                   "\n    \"body\": $input.json('$'),\n",
+  #                   "\n    \"selectedClient\": \"$input.params(\"client\")\"}"
+  #                 ]
+  #              ]
+  #           }
+  #         }
+  
+  #  DeleteclientMethodOptions:
+  #   Type: AWS::ApiGateway::Method
+  #   Properties:
+  #     RestApiId:
+  #       Ref: SentinelConnectWebPortalRestApi
+  #     ResourceId:
+  #       Ref: DeleteclientResources
+  #     AuthorizationType: NONE 
+  #     HttpMethod: OPTIONS
+  #     Integration:
+  #       IntegrationResponses:
+  #       - StatusCode: 200
+  #         ResponseParameters:
+  #           method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+  #           method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+  #           method.response.header.Access-Control-Allow-Origin: "'*'"
+  #           method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+  #           method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+  #           method.response.header.Referrer-Policy: "'no-referrer'"
+  #           method.response.header.X-Frame-Options: "'DENY'"
+  #           method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+  #           method.response.header.X-Content-Type-Options: "'nosniff'"
+  #         ResponseTemplates:
+  #           application/json: ''
+  #       RequestTemplates:
+  #         application/json: '{statusCode: 200}'
+  #       Type: MOCK
+  #     MethodResponses:
+  #     - StatusCode: 200
+  #       ResponseModels:
+  #         application/json: 'Empty'
+  #       ResponseParameters:
+  #         method.response.header.Access-Control-Allow-Headers: false
+  #         method.response.header.Access-Control-Allow-Methods: false
+  #         method.response.header.Access-Control-Allow-Origin: false
+  #         method.response.header.Permissions-Policy: false
+  #         method.response.header.Strict-Transport-Security: false
+  #         method.response.header.Referrer-Policy: false
+  #         method.response.header.X-Frame-Options: false
+  #         method.response.header.Content-Security-Policy: false
+  #         method.response.header.X-Content-Type-Options: false         
+
+  #Swagger Resource
+  SwaggerResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'swagger'
+
+  SwaggerMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref SwaggerResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebSwaggerAPI.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES     
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+
+  SwaggerMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: SwaggerResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+            method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+            method.response.header.Referrer-Policy: "'no-referrer'"
+            method.response.header.X-Frame-Options: "'DENY'"
+            method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+            method.response.header.X-Content-Type-Options: "'nosniff'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+          method.response.header.Permissions-Policy: false
+          method.response.header.Strict-Transport-Security: false
+          method.response.header.Referrer-Policy: false
+          method.response.header.X-Frame-Options: false
+          method.response.header.Content-Security-Policy: false
+          method.response.header.X-Content-Type-Options: false   
+
+ #QuickTrialSignup Resource
+  QuickTrialSignupResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'quicktrialsignup'
+
+  #QuickTrialSignup Resource Methods
+  QuickTrialSignupMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref QuickTrialSignupResource
+      AuthorizationType: NONE 
+      HttpMethod: POST
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+              method.response.header.Permissions-Policy: true
+              method.response.header.Strict-Transport-Security: true
+              method.response.header.Referrer-Policy: true
+              method.response.header.X-Frame-Options: true
+              method.response.header.Content-Security-Policy: true
+              method.response.header.X-Content-Type-Options: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebSignupQuickTrialUsers.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+              method.response.header.Referrer-Policy: "'no-referrer'"
+              method.response.header.X-Frame-Options: "'DENY'"
+              method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+
+  QuickTrialSignupMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: QuickTrialSignupResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Permissions-Policy: "'accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=*, clipboard-write=*, gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()'"
+            method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains;'"
+            method.response.header.Referrer-Policy: "'no-referrer'"
+            method.response.header.X-Frame-Options: "'DENY'"
+            method.response.header.Content-Security-Policy: "'frame-ancestors 'none';'"
+            method.response.header.X-Content-Type-Options: "'nosniff'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+          method.response.header.Permissions-Policy: false
+          method.response.header.Strict-Transport-Security: false
+          method.response.header.Referrer-Policy: false
+          method.response.header.X-Frame-Options: false
+          method.response.header.Content-Security-Policy: false
+          method.response.header.X-Content-Type-Options: false
+
+  #QuickTrialSignup Resource Methods
+  #QuickTrialSignup Resource Methods
+  #Api Gateway Deployment
+  SentinelConnectApiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      -  SentinelConnectWebPortalRestApi
+      -  ClientsMethodGet
+      -  ClientsMethodOptions
+      -  ClientsMethodPost
+      -  VerifyEMSDetailsMethodPost
+      -  VerifyEMSDetailsMethodOptions
+      -  DashboardsMethodGet
+      -  DashboardsMethodOptions
+      -  TokenMethodPost
+      -  TransactionsMethodGet
+      -  TransactionsMethodPost
+      -  TranasctionsMethodOptions
+      -  TranasctionLogsMethodPost
+      -  TranasctionLogsMethodOptions
+      -  UsersMethodDelete
+      -  UsersMethodGet
+      -  UsersMethodPost
+      -  UsersMethodPut
+      -  UsersMethodOptions
+      # -  DeleteclientResources
+      # -  DeleteclientMethodDelete
+      # -  DeleteclientMethodGet
+      # -  DeleteclientMethodOptions
+      -  SwaggerMethodGet
+      -  SwaggerMethodOptions
+      -  QuickTrialSignupMethodPost
+      -  QuickTrialSignupMethodOptions
+      -  IDOCMockGet
+      -  IDOCMockPost
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      StageName: !Ref AdminWebApiGatewayStageName
+      Description: "QA Deployment testing"
+   
+  #Web UI Lambdas
+  SentinelConnectWebListClients:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-ListClients
+      FunctionName: SentinelConnect-Web-ListClients
+      Description: SentinelConnect-Web-ListClients Function
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectWebListClientsLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebListClients}"
+      RetentionInDays: 90
+      
+  SentinelConnectWebListClientsPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebListClients
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/clients"
+        ]
+      ]
+
+  SentinelConnectWebVerifyClientEMSDetails:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-Web-VerifyClientEMSDetails
+      CodeUri: api/web/lambdas/SentinelConnect-Web-VerifyClientEMSDetails
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectWebVerifyClientEMSDetailsLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebVerifyClientEMSDetails}"
+      RetentionInDays: 90
+
+  SentinelConnectWebVerifyClientEMSDetailsPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebVerifyClientEMSDetails
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/clients/verifyemsdetails"
+        ]
+      ]
+
+  SentinelConnectWebGetChartData:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-GetChartData
+      FunctionName: SentinelConnect-Web-GetChartData
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          BucketName: !Ref SentinelConnectTransactionsDetails
+
+  SentinelConnectWebGetChartDataLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      RetentionInDays: 90
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebGetChartData}"
+
+  SentinelConnectWebGetChartDataPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebGetChartData
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/dashboards"
+        ]
+      ]
+
+  SentinelConnectWebStoreChartData:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-Web-StoreChartData
+      CodeUri: api/web/lambdas/SentinelConnect-Web-StoreChartData
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt SentinelConnectAccessRole.Arn    
+      Environment:
+        Variables:
+          BucketName: !Ref SentinelConnectTransactionsDetails
+
+  SentinelConnectWebStoreChartDataLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebStoreChartData}"
+
+  SentinelConnectWebStoreChartDataPermissions: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "SentinelConnectWebStoreChartData"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+         - "SentinelConnectStoreChartDataScheduledRule"
+         - "Arn"
+
+  SentinelConnectWebListTransactions:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-ListTransactions
+      FunctionName: SentinelConnect-Web-ListTransactions
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectWebListTransactionsLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       RetentionInDays: 90
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebListTransactions}"
+
+  SentinelConnectWebListTransactionsPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebListTransactions
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/transactions"
+        ]
+      ]
+
+  SentinelConnectWebListTransactionsPermissionsPost:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebListTransactions
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/transactions"
+        ]
+      ]
+
+  SentinelConnectWebTransactionLogs:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-TransactionLogs
+      FunctionName: SentinelConnect-Web-TransactionLogs
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          LogGroupName: SentinelConnect
+          BucketName: !Ref SentinelConnectTransactionsDetails
+
+  SentinelConnectWebTransactionLogsLogGroup: 
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+       LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebTransactionLogs}"
+       RetentionInDays: 90
+
+  SentinelConnectWebTransactionLogsPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebTransactionLogs
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/transactions/logs"
+        ]
+      ]
+
+  SentinelConnectWebCreateClient:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-CreateClient
+      FunctionName: SentinelConnect-Web-CreateClient
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectWebCreateClientLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      RetentionInDays: 90
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebCreateClient}"
+
+  SentinelConnectWebCreateClientPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebCreateClient
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/clients"
+        ]
+      ]
+
+  SentinelConnectWebCreateUser:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-CreateUser
+      FunctionName: SentinelConnect-Web-CreateUser
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          ClientId: !Ref CognitoUserPoolClient
+          UserPoolId: !Ref CognitoUserPool
+
+  SentinelConnectWebCreateUserLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebCreateUser}"
+      RetentionInDays: 90
+
+  SentinelConnectWebCreateUserPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebCreateUser
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/users"
+        ]
+      ]
+
+  SentinelConnectWebDeleteUser:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-DeleteUser
+      FunctionName: SentinelConnect-Web-DeleteUser
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15 
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          ClientTable: Client
+          ServiceAccountIdIndex: Region-ServiceAccountId-index
+          userPoolId: !Ref CognitoUserPool
+
+  SentinelConnectWebDeleteUserLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebDeleteUser}"
+      RetentionInDays: 90
+
+  SentinelConnectWebDeleteUserPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebDeleteUser
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/DELETE/users"
+        ]
+      ]
+
+  SentinelConnectWebUpdateUser:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-UpdateUser
+      FunctionName: SentinelConnect-Web-UpdateUser
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn 
+      Environment:
+        Variables:
+          UserPoolId: !Ref CognitoUserPool
+
+  SentinelConnectWebUpdateUserLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebUpdateUser}"
+      RetentionInDays: 90
+
+  SentinelConnectWebUpdateUserPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebUpdateUser
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/PUT/users"
+        ]
+      ]
+
+  SentinelConnectWebListUsers:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-ListUsers
+      FunctionName: SentinelConnect-Web-ListUsers
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          UserPoolId: !Ref CognitoUserPool
+
+  SentinelConnectWebListUsersLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebListUsers}"
+      RetentionInDays: 90
+
+  SentinelConnectWebListUsersPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebListUsers
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/users"
+        ]
+      ]
+
+# #Delete client user
+#   SentinelConnectWebDeleteClientUser:
+#     Type: "AWS::Serverless::Function"
+#     Properties:
+#       CodeUri: api/web/lambdas/SentinelConnect-Web-DeleteUser
+#       FunctionName: SentinelConnect-Web-DeleteClientUser
+#       Handler: index.handler
+#       Runtime: nodejs12.x
+#       MemorySize: 128
+#       Timeout: 15 
+#       Role: !GetAtt SentinelConnectAccessRole.Arn
+#       Environment:
+#         Variables:
+#           AuditTable: Audit
+#           ClientTable: Client
+#           ServiceAccountIdIndex: Region-ServiceAccountId-index
+#           userPoolId: us-west-1_h4umILS3c
+
+#   SentinelConnectWebDeleteClientUserLogGroup:
+#     Type: "AWS::Logs::LogGroup"
+#     Properties: 
+#       LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebDeleteClientUser}"
+#       RetentionInDays: 90
+
+#   SentinelConnectWebDeleteClientUserPermissions:
+#     Type: "AWS::Lambda::Permission"
+#     Properties:
+#       Action: lambda:InvokeFunction
+#       FunctionName: !GetAtt
+#         - SentinelConnectWebDeleteClientUser
+#         - Arn
+#       Principal: apigateway.amazonaws.com
+#       SourceArn: !Join [
+#         "", [
+#           "arn:aws:execute-api:",
+#           {"Ref": "AWS::Region"}, ":",
+#           {"Ref": "AWS::AccountId"}, ":",
+#           !Ref SentinelConnectWebPortalRestApi, "/*/DELETE/clients"
+#         ]
+#       ]
+
+# #Get Audit Details
+#   SentinelConnectWebGetAuditDetails:
+#     Type: "AWS::Serverless::Function"
+#     Properties:
+#       CodeUri: api/web/lambdas/SentinelConnect-Web-ListUsers
+#       FunctionName: SentinelConnect-Web-GetAuditDetails
+#       Handler: index.handler
+#       Runtime: nodejs12.x
+#       MemorySize: 128
+#       Timeout: 15
+#       Role: !GetAtt SentinelConnectAccessRole.Arn
+#       Environment:
+#         Variables:
+#           UserPoolId: !Ref CognitoUserPool
+
+#   SentinelConnectWebGetAuditDetailsLogGroup:
+#     Type: "AWS::Logs::LogGroup"
+#     Properties: 
+#       LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebGetAuditDetails}"
+#       RetentionInDays: 90
+
+#   SentinelConnectWebGetAuditDetailsPermissions:
+#     Type: "AWS::Lambda::Permission"
+#     Properties:
+#       Action: lambda:InvokeFunction
+#       FunctionName: !GetAtt
+#         - SentinelConnectWebGetAuditDetails
+#         - Arn
+#       Principal: apigateway.amazonaws.com
+#       SourceArn: !Join [
+#         "", [
+#           "arn:aws:execute-api:",
+#           {"Ref": "AWS::Region"}, ":",
+#           {"Ref": "AWS::AccountId"}, ":",
+#           !Ref SentinelConnectWebPortalRestApi, "/*/GET/clients"
+#         ]
+#       ]
+
+  SentinelConnectWebSignupQuickTrialUsers:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-SignUpQuickTrialUsers  
+      FunctionName: SentinelConnect-Web-SignupQuickTrialUsers
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          CreateUserFunction: !Ref SentinelConnectWebCreateUser
+          CreateClientFunction: !Ref SentinelConnectWebCreateClient
+          UserPoolId: !Ref CognitoUserPool 
+          AppClientId:  !Ref CognitoUserPoolClient
+          UserStatusTable: !Ref QuickTrialUserStatusDynamoDBTable
+          BucketName: !Ref SentinelConnectTransactionsDetails
+
+  SentinelConnectWebSignupQuickTrialUsersLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebSignupQuickTrialUsers}"
+      RetentionInDays: 90
+
+  SentinelConnectWebSignupQuickTrialUsersPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebSignupQuickTrialUsers
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/quicktrialsignup"
+        ]
+      ]
+
+  #Web Token
+  SentinelConnectAuthenticationToken:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/misc/SentinelConnect-Authentication-Token
+      FunctionName: SentinelConnect-Authentication-Token
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          UserPoolId: !Ref CognitoUserPool 
+          ClientId: !Ref CognitoUserPoolClient
+
+  SentinelConnectAuthenticationTokenLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectAuthenticationToken}"
+      RetentionInDays: 90
+     
+  SentinelConnectAuthenticationTokenPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectAuthenticationToken
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/token"
+        ]
+      ]
+
+  #Swagger
+  SentinelConnectWebSwaggerAPI:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-Web-SwaggerAPI
+      CodeUri: api/web/lambdas/SentinelConnect-Web-SwaggerAPI
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          Endpoint: !Join [
+            "", [
+              "https://",  
+              !Ref SentinelConnectServiceApi,
+              ".execute-api.",
+              {"Ref": "AWS::Region"},
+              ".amazonaws.com/v1"            
+            ]
+          ]
+          EnviromentDescription: v1 Environment
+          Version: v1
+
+  SentinelConnectWebSwaggerAPILogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${SentinelConnectWebSwaggerAPI}"
+      RetentionInDays: 90
+
+  SentinelConnectSwaggerAPIPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebSwaggerAPI
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/swagger"
+        ]
+      ]
+
+  #Sentinel Connect Default Admin User
+  SentinelConnectSAMCreateAdmin:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-SAM-CreateAdmin
+      CodeUri: api/misc/SentinelConnect-SAM-CreateAdmin
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectSAMCreateAdminLambdaInvoker:
+    Type: Custom::LambdaInvoker
+    DependsOn: SentinelConnectSAMCreateAdmin
+    Version: "1.0"
+    Properties:
+       ServiceToken: !GetAtt SentinelConnectSAMCreateAdmin.Arn
+       body:
+         {
+             "UserPoolId": !Ref CognitoUserPool,
+             "UserName": !Ref UserName,
+             "Email": !Ref Email,
+             "Phone": !Ref PhoneNo,
+             "Name": !Ref Name,
+             "TableName": SystemConfig,
+             "BucketName": !Ref SentinelConnectTransactionsDetails,
+             "FunctionName": !Ref SentinelConnectWebStoreChartData,
+             "Region": !Ref AWS::Region,
+             "Account": !Ref AWS::AccountId,
+             "Name": !Ref AWS::AccountId
+         }
+
+
+  SentinelConnectServiceOracleEntitlement:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/service/lambdas/SentinelConnect-Service-OracleEntitlement
+      FunctionName: SentinelConnect-Service-OracleEntitlement
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Layers:
+         - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          BucketName: !Ref SentinelConnectTransactionsDetails
+
+  SentinelConnectServiceOracleEntitlementPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectServiceOracleEntitlement
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/oracle-entitlement"
+        ]
+      ]
+
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Outputs                                                                      #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  
+  ## SAP configurations
+
+  IDOCAdapterAPI:
+      Type: AWS::ApiGateway::RestApi
+      Properties:
+        Name: sap-idoc-adapter-api
+        Description: SAP IDOC adapter API
+        EndpointConfiguration:
+          Types:
+            - REGIONAL
+
+  AdapterGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.WWW-Authenticate: "'Basic'"
+      ResponseTemplates:
+        application/json: '{"message":$context.error.messageString}'
+      ResponseType: UNAUTHORIZED
+      RestApiId: !Ref IDOCAdapterAPI
+      StatusCode: '401'
+
+
+
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Outputs                                                                      #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  
+Outputs:
+  Region:
+    Description: "Region"
+    Value: !Ref AWS::Region
+
+  CognitoUserPoolId:
+    Description: "Cognito User Pool Id"
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Description: "Cognito User Pool Client Id"
+    Value: !Ref CognitoUserPoolClient
+
+  CognitoIdentityPoolId:
+    Description: "Cognito Identity Pool Id"
+    Value: !Ref CognitoIdentityPool
