@@ -776,7 +776,7 @@ Resources:
           SoapRequest: /entitlement/soap
           UpdateEntitlement: SentinelConnect-Service-UpdateEntitlement
           ValidateAndSaveRequest: SentinelConnect-Service-PersistenceEngine
-          privatekey: 
+          privatekey: Process.env.Private_Key
 
   SentinelConnectServiceExecutionFlowLogGroup: 
     Type: "AWS::Logs::LogGroup"
